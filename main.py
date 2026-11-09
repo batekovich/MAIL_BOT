@@ -19,15 +19,15 @@ from aiogram.filters import Command
 from aioimaplib import aioimaplib
 
 # ==================== НАСТРОЙКИ ПРОЕКТА ====================
-TG_TOKEN = "НАПИШИ_ТОКЕН_БОТА"              # от @BotFather
-MODERATOR_CHAT_ID = -1000000000000  # ID чата ваших модераторов (число, без кавычек)
+TG_TOKEN = "API_ВАШЕГО_БОТА"
+MODERATOR_CHAT_ID = -0  # ВПИШИ СЮДА ID СВОЕГО ЧАТА
 
-IMAP_SERVER = "imap.ВАШДОМЕН.ru"
+IMAP_SERVER = "ВАШ_IMAP_СЕРВЕР"
 IMAP_PORT = 993
-EMAIL_USER = "НАПИШИ_ПОЧТУ"
-EMAIL_PASSWORD = "НАПИШИ_ПАРОЛЬ_ПРИЛОЖЕНИЯ"
+EMAIL_USER = "ВАША_ПОЧТА"
+EMAIL_PASSWORD = "ПАРОЛЬ_ПОЧТЫ"
 
-SMTP_SERVER = "smtp.ВАШДОМЕН.ru"
+SMTP_SERVER = "ВАШ_SMTP_СЕРВЕР"
 SMTP_PORT = 465
 # ============================================================
 
@@ -53,7 +53,7 @@ def _log(msg):
         print(f"[log] Не удалось записать в log.txt: {exc}")
 
 # Автоочистка базы: сколько дней хранить заявки и как часто проверять
-DB_RETENTION_DAYS = 7
+DB_RETENTION_DAYS = 30
 DB_CLEANUP_INTERVAL = 24 * 60 * 60
 
 bot = Bot(token=TG_TOKEN)
@@ -145,6 +145,14 @@ async def db_cleanup_loop():
         await asyncio.sleep(DB_CLEANUP_INTERVAL)
 
 
+def format_ticket_no(number):
+    """Номер заявки в виде 00001. В базе номер растёт сам и после чистки не сбрасывается."""
+    try:
+        return f"{int(number):05d}"
+    except (TypeError, ValueError):
+        return str(number)
+
+
 def _migrate_tickets(cursor):
     """Старая база могла создать tickets без ticket_id — переносим данные в новую схему."""
     cols = [row[1] for row in cursor.execute("PRAGMA table_info(tickets)")]
@@ -192,7 +200,7 @@ def save_ticket(tg_msg_id, user_email):
     row = cursor.fetchone()
     ticket_id = row[0] if row else 1
     conn.close()
-    return 10000 + ticket_id
+    return format_ticket_no(ticket_id)
 
 def get_ticket_info(tg_msg_id):
     conn = sqlite3.connect(DB_PATH)
@@ -201,7 +209,7 @@ def get_ticket_info(tg_msg_id):
     row = cursor.fetchone()
     conn.close()
     if row:
-        return row[0], 10000 + row[1], row[2]
+        return row[0], format_ticket_no(row[1]), row[2]
     return None, None, None
 
 def mark_ticket_as_replied(tg_msg_id):
@@ -282,7 +290,7 @@ def decode_mime_header(header_value):
 # --- АВТОМАТИЧЕСКОЕ ПОДТВЕРЖДЕНИЕ ЗАЯВКИ ПОЛЬЗОВАТЕЛЮ ---
 def send_auto_confirmation_email(user_email, ticket_number):
     msg = MIMEMultipart("related")
-    msg["Subject"] = f"Ваша заявка №{ticket_number} принята — Поддержка BrokenVK ВАЖНО:Если вы отправили файл убедитесь в том что не превышает 50 МБ, иначе не примем "
+    msg["Subject"] = f"Ваша заявка №{ticket_number} принята — Поддержка BrokenVK"
     msg["From"] = EMAIL_USER
     msg["To"] = user_email
 
@@ -298,7 +306,7 @@ def send_auto_confirmation_email(user_email, ticket_number):
         <div style="background-color: #f4f6f9; border-top: 4px solid #4caf50; padding: 20px; margin-bottom: 25px; border-radius: 4px; display: inline-block; text-align: left; min-width: 350px;">
           <h3 style="color: #4caf50; margin-top: 0; font-size: 18px;">Ваша заявка успешно принята!</h3>
           <p style="font-size: 15px; margin: 10px 0;">Ей присвоен уникальный номер: <strong style="color: #5181b8;">№{ticket_number}</strong></p>
-          <p style="color: #555555; font-size: 14px; margin: 0 0 15px 0;">Наши модераторы уже изучают ваше обращение и ответят вам в ближайшее время. Пожалуйста, не создавайте повторных запросов.</p>
+          <p style="color: #555555; font-size: 14px; margin: 0 0 15px 0;">Наши модераторы уже изучают ваше обращение и ответят вам в ближайшее время. Пожалуйста, не создавайте повторных запросов, также если вы отправили файл, убедитесь в том что он не весит больше 50 МБ, иначе не примем</p>
         </div>
         <hr style="border: 0; border-top: 1px solid #eeeeee; margin: 20px 0;">
         <div style="font-size: 13px; color: #666666; text-align: center;">
@@ -761,11 +769,78 @@ async def handle_moderator_reply(message: types.Message):
         else:
             await message.reply("❌ Не удалось найти получателя или номер заявки в базе данных.")
 
+
+# ============ АВТООЧИСТКА ЛОГОВ РАЗ В 30 ДНЕЙ ============
+NOHUP_LOG_PATH = os.path.join(BASE_DIR, "nohup.out")
+LOG_CLEAR_DAYS = 30
+LOG_CLEAR_INTERVAL = 60 * 60
+LOG_CLEAR_MARKER = os.path.join(BASE_DIR, ".log_cycle.txt")
+
+
+def logs_need_clear():
+    """True, если с последней очистки прошло 30 дней. Первый запуск только ставит метку."""
+    now = datetime.datetime.now().timestamp()
+    if not os.path.exists(LOG_CLEAR_MARKER):
+        with open(LOG_CLEAR_MARKER, "w", encoding="utf-8") as f:
+            f.write(str(now))
+        return False
+    with open(LOG_CLEAR_MARKER, "r", encoding="utf-8") as f:
+        started = float((f.read().strip() or "0"))
+    if started <= 0:
+        with open(LOG_CLEAR_MARKER, "w", encoding="utf-8") as f:
+            f.write(str(now))
+        return False
+    return (now - started) >= LOG_CLEAR_DAYS * 86400
+
+
+def clear_logs():
+    for path in (LOG_PATH, NOHUP_LOG_PATH):
+        try:
+            if os.path.exists(path):
+                with open(path, "w", encoding="utf-8"):
+                    pass
+        except Exception as exc:
+            print(f"[log] Не удалось очистить {path}: {exc}")
+    with open(LOG_CLEAR_MARKER, "w", encoding="utf-8") as f:
+        f.write(str(datetime.datetime.now().timestamp()))
+
+
+async def log_cleanup_loop():
+    while True:
+        try:
+            if logs_need_clear():
+                clear_logs()
+                _log(f"[Логи] log.txt и nohup.out очищены, следующая очистка через {LOG_CLEAR_DAYS} дн.")
+        except Exception as exc:
+            print(f"[Логи] Ошибка автоочистки: {exc}")
+        await asyncio.sleep(LOG_CLEAR_INTERVAL)
+
+
 async def main():
+    import logging
+
+    # Ошибки aiogram и всего, кроме почты, идут в nohup.out
+    fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    file_handler = logging.FileHandler(NOHUP_LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(fmt)
+    root.addHandler(console_handler)
+
+    # Почтовые ошибки и события — в log.txt
+    _log(f"=== Бот запущен === файл: {os.path.abspath(__file__)} | база: {DB_PATH} | лог: {LOG_PATH} | aiogram: {NOHUP_LOG_PATH}")
+
     init_db()
     asyncio.create_task(check_imap_email_loop())
     asyncio.create_task(db_cleanup_loop())
+    asyncio.create_task(log_cleanup_loop())
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
