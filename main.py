@@ -311,8 +311,8 @@ def send_auto_confirmation_email(user_email, ticket_number):
         <hr style="border: 0; border-top: 1px solid #eeeeee; margin: 20px 0;">
         <div style="font-size: 13px; color: #666666; text-align: center;">
           <p style="margin: 0 0 8px 0; font-weight: bold; color: #333333;">С уважением, поддержка BrokenVK</p>
-          <p style="margin: 0 0 4px 0;">Посетите наш официальный сайт: <a href="http://brokenvk.ru" style="color: #5181b8; text-decoration: none; font-weight: bold;">brokenvk.ru</a></p>
-          <p style="margin: 0; font-size: 11px; color: #999999;">Зеркало проекта: <a href="http://brokenvk.ru" style="color: #777777; text-decoration: none;">brokenvk.ru</a></p>
+          <p style="margin: 0 0 4px 0;">Посетите наш официальный сайт: <a href="http://example.ru" style="color: #5181b8; text-decoration: none; font-weight: bold;">example.ru</a></p>
+          <p style="margin: 0; font-size: 11px; color: #999999;">Зеркало проекта: <a href="http://example.ru" style="color: #777777; text-decoration: none;">example.ru</a></p>
         </div>
       </body>
     </html>
