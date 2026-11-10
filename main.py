@@ -3,11 +3,14 @@ import datetime
 import email
 import re
 from email.header import decode_header
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 import mimetypes
 import os
+import logging
 import smtplib
 import sqlite3
+import sys
+import traceback
 from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -19,15 +22,15 @@ from aiogram.filters import Command
 from aioimaplib import aioimaplib
 
 # ==================== НАСТРОЙКИ ПРОЕКТА ====================
-TG_TOKEN = "API_ВАШЕГО_БОТА"
-MODERATOR_CHAT_ID = -0  # ВПИШИ СЮДА ID СВОЕГО ЧАТА
+TG_TOKEN = "НАПИШИ_ТОКЕН_БОТА"
+MODERATOR_CHAT_ID = -1000000000000
 
-IMAP_SERVER = "ВАШ_IMAP_СЕРВЕР"
+IMAP_SERVER = "imap.ВАШДОМЕН.ru"
 IMAP_PORT = 993
-EMAIL_USER = "ВАША_ПОЧТА"
-EMAIL_PASSWORD = "ПАРОЛЬ_ПОЧТЫ"
+EMAIL_USER = "НАПИШИ_ПОЧТУ"
+EMAIL_PASSWORD = "НАПИШИ_ПАРОЛЬ_ПРИЛОЖЕНИЯ"
 
-SMTP_SERVER = "ВАШ_SMTP_СЕРВЕР"
+SMTP_SERVER = "smtp.ВАШДОМЕН.ru"
 SMTP_PORT = 465
 # ============================================================
 
@@ -42,15 +45,113 @@ LOG_MAX_BYTES = 1024 * 1024
 
 
 def _log(msg):
+    """Пишет строку в log.txt. В терминал ничего не выводит."""
     line = f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
-    print(line)
     try:
         if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
             os.replace(LOG_PATH, LOG_PATH + ".old")
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as exc:
-        print(f"[log] Не удалось записать в log.txt: {exc}")
+        sys.stderr.write(f"[КРИТИЧНО] Не удалось записать в log.txt: {exc}\n")
+
+
+def _critical(msg):
+    """Критическая ошибка: log.txt, nohup.out и терминал (stderr)."""
+    _log(f"[КРИТИЧНО] {msg}")
+
+    # уже перенаправлено в nohup.out самим nohup — второй раз не пишем
+    try:
+        same_file = os.fstat(sys.stderr.fileno()).st_ino == os.stat(NOHUP_LOG_PATH).st_ino
+    except Exception:
+        same_file = False
+    if not same_file:
+        try:
+            line = f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] [КРИТИЧНО] {msg}"
+            with open(NOHUP_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    try:
+        sys.stderr.write(f"[КРИТИЧНО] {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+class _LogTxtHandler(logging.Handler):
+    """Перекидывает записи logging в log.txt через _log()."""
+
+    def emit(self, record):
+        try:
+            _log(f"{record.levelname} {record.name}: {record.getMessage()}")
+        except Exception:
+            pass
+
+
+def setup_logging():
+    """Терминал молчит: всё идёт в log.txt, ошибки дублируются в nohup.out,
+    в консоль пробиваются только критические сообщения."""
+    fmt = logging.Formatter(
+        "[%(asctime)s] %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+
+    # log.txt — всё, что пишется через logging
+    to_log = _LogTxtHandler()
+    to_log.setLevel(logging.INFO)
+    root.addHandler(to_log)
+
+    # nohup.out — ошибки и выше (если бот запущен вручную без nohup, файл всё равно пишется)
+    try:
+        to_nohup = logging.FileHandler(NOHUP_LOG_PATH, encoding="utf-8")
+        to_nohup.setLevel(logging.ERROR)
+        to_nohup.setFormatter(fmt)
+        root.addHandler(to_nohup)
+    except Exception as exc:
+        _log(f"[Логи] Не удалось открыть nohup.out: {exc}")
+
+    # терминал — только КРИТИЧНОЕ
+    terminal = logging.StreamHandler(sys.stderr)
+    terminal.setLevel(logging.CRITICAL)
+    terminal.setFormatter(fmt)
+    root.addHandler(terminal)
+
+    # болтливые библиотеки не сыпят INFO
+    for name in ("aiogram", "aiohttp", "aioimaplib", "asyncio"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def install_crash_handlers():
+    """Падения вне try/except тоже уходят в log.txt, а не в терминал."""
+
+    def _excepthook(exc_type, exc, tb):
+        _critical(
+            "Необработанная ошибка:\n"
+            + "".join(traceback.format_exception(exc_type, exc, tb))
+        )
+
+    sys.excepthook = _excepthook
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    def _loop_handler(loop_, context):
+        exc = context.get("exception")
+        if exc is not None:
+            text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        else:
+            text = str(context.get("message", "неизвестная ошибка"))
+        _critical("Ошибка в фоновой задаче:\n" + text)
+
+    loop.set_exception_handler(_loop_handler)
 
 # Автоочистка базы: сколько дней хранить заявки и как часто проверять
 DB_RETENTION_DAYS = 30
@@ -219,7 +320,7 @@ def mark_ticket_as_replied(tg_msg_id):
     conn.commit()
     conn.close()
 
-# --- ЧЁРНЫЙ СПИСОК (ЧС) ---
+# --- ИГНОР (чёрный список адресов) ---
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -275,6 +376,49 @@ def list_blacklist(limit=100):
         conn.close()
 
 
+# --- АНТИФЛУД: автоматический игнор отправителя ---
+FLOOD_LIMIT = 15      # столько писем от одного адреса
+FLOOD_WINDOW = 20     # за столько секунд
+
+_flood_times = {}     # email -> список отметок времени его писем
+
+
+def _message_timestamp(msg):
+    """Время письма по заголовку Date; если он битый — текущее время."""
+    now = datetime.datetime.now().timestamp()
+    try:
+        dt = parsedate_to_datetime(msg.get("Date"))
+        if dt is None:
+            return now
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        ts = dt.timestamp()
+        # часы отправителя могут убежать вперёд — такие считаем как «сейчас»
+        return now if ts > now + 300 else ts
+    except Exception:
+        return now
+
+
+def is_flooding(email, ts=None):
+    """True, если от адреса пришло FLOOD_LIMIT писем за FLOOD_WINDOW секунд."""
+    if not email or "@" not in email:
+        return False
+    now = datetime.datetime.now().timestamp()
+    key = email.strip().lower()
+    stamps = _flood_times.setdefault(key, [])
+    stamps.append(now if ts is None else ts)
+
+    cutoff = (now if ts is None else ts) - FLOOD_WINDOW
+    stamps[:] = [s for s in stamps if s >= cutoff]
+
+    # Словарь не должен расти бесконечно: старые адреса забываем
+    if len(_flood_times) > 500:
+        for old_key in [k for k, v in _flood_times.items() if not v or max(v) < now - 3600]:
+            _flood_times.pop(old_key, None)
+
+    return len(stamps) >= FLOOD_LIMIT
+
+
 def decode_mime_header(header_value):
     if not header_value:
         return "Без темы"
@@ -311,8 +455,8 @@ def send_auto_confirmation_email(user_email, ticket_number):
         <hr style="border: 0; border-top: 1px solid #eeeeee; margin: 20px 0;">
         <div style="font-size: 13px; color: #666666; text-align: center;">
           <p style="margin: 0 0 8px 0; font-weight: bold; color: #333333;">С уважением, поддержка BrokenVK</p>
-          <p style="margin: 0 0 4px 0;">Посетите наш официальный сайт: <a href="http://example.ru" style="color: #5181b8; text-decoration: none; font-weight: bold;">example.ru</a></p>
-          <p style="margin: 0; font-size: 11px; color: #999999;">Зеркало проекта: <a href="http://example.ru" style="color: #777777; text-decoration: none;">example.ru</a></p>
+          <p style="margin: 0 0 4px 0;">Посетите наш официальный сайт: <a href="http://brokenvk.ru" style="color: #5181b8; text-decoration: none; font-weight: bold;">brokenvk.ru</a></p>
+          <p style="margin: 0; font-size: 11px; color: #999999;">Зеркало проекта: <a href="http://brokenvk.ru" style="color: #777777; text-decoration: none;">brokenvk.ru</a></p>
         </div>
       </body>
     </html>
@@ -540,9 +684,37 @@ async def check_imap_email_loop():
 
                     clean_email = parseaddr(from_user)[1]
 
-                    # Письма из ЧС: сразу прочитано, без тикета, автоответа и уведомления
+                    # Антифлуд: 15 писем за 20 секунд — адрес уходит в игнор сам
+                    if not is_blacklisted(clean_email) and is_flooding(
+                        clean_email, _message_timestamp(msg)
+                    ):
+                        _log(
+                            f"[АНТИФЛУД] {clean_email}: {FLOOD_LIMIT} писем за "
+                            f"{FLOOD_WINDOW} с — автоматический игнор"
+                        )
+                        add_to_blacklist(
+                            clean_email,
+                            f"автоигнор: {FLOOD_LIMIT} писем за {FLOOD_WINDOW} с",
+                            "Антифлуд",
+                        )
+                        _flood_times.pop(clean_email.strip().lower(), None)
+                        try:
+                            await bot.send_message(
+                                chat_id=MODERATOR_CHAT_ID,
+                                text=(
+                                    f"🚫 Антифлуд: {clean_email} добавлен в игнор\n"
+                                    f"Причина: {FLOOD_LIMIT} писем за {FLOOD_WINDOW} секунд\n"
+                                    f"Вернуть: /unignore {clean_email}"
+                                ),
+                            )
+                        except Exception as e:
+                            _log(f"[АНТИФЛУД] Не удалось уведомить модераторов: {e}")
+                        await imap_client.store(num, "+FLAGS", "\\Seen")
+                        continue
+
+                    # Письма из игнора: сразу прочитано, без тикета, автоответа и уведомления
                     if is_blacklisted(clean_email):
-                        _log(f"[ЧС] Письмо от {clean_email} проигнорировано")
+                        _log(f"[Игнор] Письмо от {clean_email} проигнорировано")
                         await imap_client.store(num, "+FLAGS", "\\Seen")
                         continue
 
@@ -591,10 +763,10 @@ async def check_imap_email_loop():
 # --- КОМАНДЫ ЧЁРНОГО СПИСКА ---
 BAN_USAGE = (
     "Как использовать:\n"
-    "• /ban spam@example.com спам — по адресу\n"
-    "• /ban спам — ответом на сообщение заявки, адрес возьмётся из базы\n"
-    "• /unban spam@example.com — убрать из ЧС\n"
-    "• /banlist — показать чёрный список"
+    "• /ignore spam@example.com спам — по адресу\n"
+    "• /ignore спам — ответом на сообщение заявки, адрес возьмётся из базы\n"
+    "• /unignore spam@example.com — убрать из игнора\n"
+    "• /ignorelist — показать список игнора"
 )
 
 
@@ -634,21 +806,21 @@ def _ban_target(message):
     return (email.strip().strip("<>").lower() if email else None), reason
 
 
-@dp.message(Command("ban"))
+@dp.message(Command("ignore"))
 async def cmd_ban(message: types.Message):
     if not _is_mod_chat(message):
         return
 
     email, reason = _ban_target(message)
     if not email:
-        await message.reply(f"❌ Не понял, кого банить.\n\n{BAN_USAGE}")
+        await message.reply(f"❌ Не понял, кого игнорить.\n\n{BAN_USAGE}")
         return
     if not EMAIL_RE.match(email):
         await message.reply(f"❌ Это не похоже на e-mail: {email}")
         return
 
     is_new = add_to_blacklist(email, reason, _mod_name(message))
-    title = "🚫 Добавлен в ЧС" if is_new else "♻️ Обновлён в ЧС"
+    title = "🚫 Добавлен в игнор" if is_new else "♻️ Обновлён в игноре"
     await message.reply(
         f"{title}: {email}\n"
         f"Причина: {reason or '—'}\n"
@@ -656,7 +828,7 @@ async def cmd_ban(message: types.Message):
     )
 
 
-@dp.message(Command("unban", "unblock"))
+@dp.message(Command("unignore", "unblock"))
 async def cmd_unban(message: types.Message):
     if not _is_mod_chat(message):
         return
@@ -669,26 +841,26 @@ async def cmd_unban(message: types.Message):
         email = ticket_email.strip().lower() if ticket_email else None
 
     if not email:
-        await message.reply("Укажите адрес: /unban spam@example.com")
+        await message.reply("Укажите адрес: /unblock spam@example.com")
         return
 
     if remove_from_blacklist(email):
-        await message.reply(f"✅ {email} убран из ЧС.")
+        await message.reply(f"✅ {email} убран из игнора.")
     else:
-        await message.reply(f"ℹ️ {email} в ЧС не найден.")
+        await message.reply(f"ℹ️ {email} в игноре не найден.")
 
 
-@dp.message(Command("banlist", "blacklist"))
+@dp.message(Command("ignorelist", "blacklist"))
 async def cmd_banlist(message: types.Message):
     if not _is_mod_chat(message):
         return
 
     rows = list_blacklist()
     if not rows:
-        await message.answer("🧾 Чёрный список пуст.")
+        await message.answer("🧾 Игнор почт пуст.")
         return
 
-    lines = [f"🧾 Чёрный список — {len(rows)}:"]
+    lines = [f"🧾 Игнор почт — {len(rows)}:"]
     for index, (email, reason, added_by, added_at) in enumerate(rows, start=1):
         lines.append(
             f"{index}. {email} — {reason or 'без причины'}\n"
@@ -800,7 +972,7 @@ def clear_logs():
                 with open(path, "w", encoding="utf-8"):
                     pass
         except Exception as exc:
-            print(f"[log] Не удалось очистить {path}: {exc}")
+            _log(f"[Логи] Не удалось очистить {path}: {exc}")
     with open(LOG_CLEAR_MARKER, "w", encoding="utf-8") as f:
         f.write(str(datetime.datetime.now().timestamp()))
 
@@ -812,25 +984,13 @@ async def log_cleanup_loop():
                 clear_logs()
                 _log(f"[Логи] log.txt и nohup.out очищены, следующая очистка через {LOG_CLEAR_DAYS} дн.")
         except Exception as exc:
-            print(f"[Логи] Ошибка автоочистки: {exc}")
+            _log(f"[Логи] Ошибка автоочистки: {exc}")
         await asyncio.sleep(LOG_CLEAR_INTERVAL)
 
 
 async def main():
-    import logging
-
-    # Ошибки aiogram и всего, кроме почты, идут в nohup.out
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s")
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    for h in root.handlers[:]:
-        root.removeHandler(h)
-    file_handler = logging.FileHandler(NOHUP_LOG_PATH, encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    root.addHandler(file_handler)
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(fmt)
-    root.addHandler(console_handler)
+    setup_logging()
+    install_crash_handlers()
 
     # Почтовые ошибки и события — в log.txt
     _log(f"=== Бот запущен === файл: {os.path.abspath(__file__)} | база: {DB_PATH} | лог: {LOG_PATH} | aiogram: {NOHUP_LOG_PATH}")
@@ -843,4 +1003,13 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        _log("=== Бот остановлен вручную (Ctrl+C) ===")
+    except Exception as exc:
+        _critical(
+            "Бот упал: "
+            + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        )
+        sys.exit(1)
